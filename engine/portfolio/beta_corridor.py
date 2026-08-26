@@ -1,9 +1,10 @@
 """Beta Corridor Engine — Dataset 1 integration.
 Manages portfolio beta within the 7%-12% return corridor.
 Alpha extracted through IG/Fallen Angel names or RV mispricing.
-Uses OpenBB for market data (paper broker mode).
+Uses direct Schwab market data. Futures execution remains on PaperBroker.
 """
 
+import logging
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -11,7 +12,17 @@ from typing import Optional
 from datetime import datetime
 from enum import Enum
 
-from ..data.yahoo_data import get_market_stats, get_adj_close
+logger = logging.getLogger("metadron.decision.beta_corridor")
+
+from ..data.openbb_data import get_market_stats, get_adj_close
+
+try:
+    from ..utils.money import D, money, to_float, safe_div
+except ImportError:
+    from decimal import Decimal as D  # type: ignore
+    def money(v): return round(float(v), 2)  # type: ignore
+    def to_float(v): return float(v)  # type: ignore
+    def safe_div(n, d, default=0): return n / d if d != 0 else default  # type: ignore
 
 # ---- Configuration --------------------------------------------------------
 ALPHA = 0.02                  # 2% secular alpha headstart
@@ -47,7 +58,7 @@ class BetaAction:
     """Rebalance action from the beta engine."""
     action: str = "HOLD"      # BUY / SELL / HOLD
     quantity: int = 0
-    instrument: str = "SPY"   # Paper broker uses SPY as proxy
+    instrument: str = "SPY"   # trade log uses SPY as proxy
     target_beta: float = 0.0
     current_beta: float = 0.0
     reason: str = ""
@@ -270,7 +281,7 @@ class CorridorAnalytics:
 # ---- Beta Corridor Engine -------------------------------------------------
 class BetaCorridor:
     """Manages portfolio beta within the 7-12% return corridor.
-    Paper broker mode: uses SPY as the beta instrument proxy."""
+    trade log mode: uses SPY as the beta instrument proxy."""
 
     def __init__(self, nav: float = 1_000_000, alpha: float = ALPHA,
                  r_low: float = R_LOW, r_high: float = R_HIGH,
@@ -377,7 +388,7 @@ class BetaCorridor:
 
     def compute_rebalance(self, state: BetaState, instrument_price: float = 500.0,
                           contract_multiplier: float = 1.0) -> BetaAction:
-        """Translate target beta into paper broker action (SPY proxy)."""
+        """Translate target beta into trade log action (SPY proxy)."""
         action = BetaAction()
         action.target_beta = state.target_beta
         action.current_beta = self.current_beta
@@ -417,6 +428,22 @@ class BetaCorridor:
     def run_cycle(self, regime_beta_cap: Optional[float] = None) -> tuple[BetaState, BetaAction]:
         """Full cycle: fetch data -> compute beta -> generate action."""
         stats = self.update_market_stats()
+        if stats.get("error") or stats.get("Rm") is None:
+            # No market data available — return safe HOLD state
+            state = BetaState(
+                current_beta=self.current_beta,
+                target_beta=self.current_beta,
+                Rm=0.0, sigma_m=0.15,
+                vol_adjustment=1.0,
+                base_beta=self.current_beta,
+                regime_beta_cap=regime_beta_cap,
+                corridor_position="UNKNOWN",
+                last_price=0.0,
+            )
+            action = BetaAction(action="HOLD", quantity=0, instrument="SPY",
+                                target_beta=self.current_beta, current_beta=self.current_beta,
+                                reason=f"No market data: {stats.get('error', 'unknown')}")
+            return state, action
         state = self.calculate_target_beta(
             Rm=stats["Rm"], sigma_m=stats["sigma_m"], regime_beta_cap=regime_beta_cap,
         )

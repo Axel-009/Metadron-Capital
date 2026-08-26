@@ -24,13 +24,14 @@ Deep Trading Features:
     - Intraday momentum decomposition
 
 Risk Gate Manager:
-    - Pre-trade risk validation (8 gates)
+    - Pre-trade risk validation (4-gates)
     - Position-level limits
     - Portfolio-level limits
     - Drawdown circuit breakers
 """
 
 import logging
+import os
 import numpy as np
 import pandas as pd
 from collections import deque
@@ -39,11 +40,19 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 
+try:
+    from ..utils.money import D, money, to_float, safe_div
+except ImportError:
+    from decimal import Decimal as D  # type: ignore
+    def money(v): return round(float(v), 2)  # type: ignore
+    def to_float(v): return float(v)  # type: ignore
+    def safe_div(n, d, default=0): return n / d if d != 0 else default  # type: ignore
+
 from ..data.universe_engine import (
     UniverseEngine, get_engine, SECTOR_ETFS,
     MACRO_ONLY_TICKERS, TRADEABLE_ETFS, AssetClass,
 )
-from ..data.yahoo_data import get_returns, get_adj_close, get_market_stats
+from ..data.schwab_data import get_returns, get_adj_close, get_market_stats
 from ..signals.macro_engine import MacroEngine, MacroSnapshot, MarketRegime
 from ..signals.metadron_cube import MetadronCube, CubeOutput
 from ..ml.alpha_optimizer import AlphaOptimizer, AlphaOutput, AlphaSignal
@@ -51,13 +60,6 @@ from ..portfolio.beta_corridor import BetaCorridor, BetaState, BetaAction
 from .paper_broker import (
     PaperBroker, OrderSide, SignalType, Position,
 )
-
-# Alpaca broker (primary)
-try:
-    from .alpaca_broker import AlpacaBroker
-except ImportError:
-    AlpacaBroker = None  # type: ignore[assignment,misc]
-
 
 # L7 HFT Technical Execution (quant-trading strategies)
 try:
@@ -121,7 +123,7 @@ try:
 except ImportError:
     L7UnifiedExecutionSurface = None  # type: ignore[assignment,misc]
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("metadron.execution.engine")
 
 
 # ---------------------------------------------------------------------------
@@ -141,9 +143,9 @@ class MicroPriceEstimate:
 
 
 class MicroPriceEngine:
-    """Estimate micro-prices from daily OHLCV data (OpenBB).
+    """Estimate micro-prices from direct Schwab OHLCV data.
 
-    In paper broker mode, we estimate bid/ask from high/low range
+    In trade log (reconciliation), we estimate bid/ask from high/low range
     and compute order flow imbalance from close position within range.
     """
 
@@ -794,8 +796,8 @@ class MLVoteEnsemble:
                 # Linear model: score = sigmoid(X @ w)
                 score = 1 / (1 + np.exp(-features @ weights))
                 return 1 if score > 0.5 else -1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Tier-1 neural model weight loading failed for ticker=%s: %s", ticker, e)
 
         # Fallback: momentum-based (not random noise)
         # Short momentum weighted more than medium
@@ -1104,7 +1106,7 @@ class ExecutionEngine:
 
     Runs the complete Metadron Capital investment engine with:
     - Deep trading features (micro-price, cross-asset)
-    - 8-gate risk management
+    - 4-gate risk management
     - Smart trade allocation
     - Pipeline performance tracking
     """
@@ -1114,32 +1116,25 @@ class ExecutionEngine:
         initial_nav: Optional[float] = None,
         top_n_per_sector: int = 5,
         enable_risk_gates: bool = True,
-        broker_type: str = "alpaca",
+        broker_type: str = "schwab",
     ):
-        # Resolve NAV: use Alpaca account if available, otherwise passed value
         self._requested_nav = initial_nav
 
-        # Broker: Alpaca (primary) — NO silent fallback
+        # Direct Schwab is the live equity/options broker.  PaperBroker is
+        # reserved for explicitly requested testing and the futures sleeve.
         self._broker_alert = None
-        if broker_type == "alpaca":
-            if AlpacaBroker is not None:
-                try:
-                    self.broker = AlpacaBroker(initial_cash=initial_nav or 1_000_000.0)
-                    logger.info("ExecutionEngine using AlpacaBroker (paper=%s)",
-                                self.broker.paper)
-                    self._broker_alert = None
-                except Exception as e:
-                    logger.error("🚨 BROKER ALERT: AlpacaBroker failed: %s", e)
-                    logger.error("🚨 FIX: Set ALPACA_API_KEY and ALPACA_SECRET_KEY in .env")
-                    raise RuntimeError(f"AlpacaBroker initialization failed: {e}")
-            else:
-                logger.error("🚨 BROKER ALERT: AlpacaBroker module not available")
-                raise RuntimeError("AlpacaBroker module not available. Install alpaca-py.")
+        if broker_type == "schwab":
+            try:
+                from .schwab_broker import SchwabBroker
+                self.broker = SchwabBroker(initial_cash=initial_nav or 100_000.0)
+                logger.info("ExecutionEngine using SchwabBroker")
+            except Exception as e:
+                raise RuntimeError("SchwabBroker initialization failed") from e
+        elif broker_type in {"paper", "test"}:
+            self.broker = PaperBroker(initial_cash=initial_nav or 100_000.0)
+            self._broker_alert = "NOTICE: PaperBroker enabled for testing only"
         else:
-            # Explicit paper mode (no Alpaca)
-            self.broker = PaperBroker(initial_cash=initial_nav or 1_000_000.0)
-            logger.info("ExecutionEngine using PaperBroker (explicit)")
-            self._broker_alert = "NOTICE: Using PaperBroker (explicit paper mode)"
+            raise ValueError(f"Unsupported broker_type={broker_type!r}; use schwab or paper for tests")
 
         # Dynamic NAV: pull from broker if it has live data
         self._dynamic_nav = self._resolve_nav()
@@ -1213,7 +1208,8 @@ class ExecutionEngine:
             logger.warning(f"QuantStrategyExecutor init failed: {e}")
 
         # Learning loop — closed-loop feedback across all engines
-        self.learning = LearningLoop() if LearningLoop is not None else None
+        test_stage = os.getenv("METADRON_STAGE", "").lower() in {"test", "testing"} or broker_type in {"paper", "test"}
+        self.learning = LearningLoop() if LearningLoop is not None and not test_stage else None
         if self.learning is not None:
             try:
                 loaded = self.learning.load_outcomes()
@@ -1226,9 +1222,13 @@ class ExecutionEngine:
         self.l7: Optional[L7UnifiedExecutionSurface] = None
         if L7UnifiedExecutionSurface is not None:
             try:
+                from .options_engine import OptionsEngine
+                options_engine = OptionsEngine(nav=self._dynamic_nav, market_data=getattr(self.broker, "market_data", None))
+                futures_broker = PaperBroker(initial_cash=self._dynamic_nav)
                 self.l7 = L7UnifiedExecutionSurface(
-                    initial_cash=initial_nav,
-                    alpaca_paper=True,
+                    initial_cash=self._dynamic_nav, broker=self.broker,
+                    futures_broker=futures_broker, options_engine=options_engine,
+                    test_stage=test_stage,
                 )
                 logger.info("L7 Unified Execution Surface initialized")
             except Exception as e:
@@ -1238,25 +1238,33 @@ class ExecutionEngine:
         self._trade_log = []  # Track which broker each trade went through
 
     def _resolve_nav(self) -> float:
-        """
-        Resolve NAV dynamically from broker.
-        
+        """Resolve NAV dynamically from broker.
+
         Priority:
-        1. Alpaca account equity (live)
-        2. Broker state NAV (paper)
+        1. Direct broker account equity
+        2. Broker state NAV (trade log mode)
         3. Requested NAV (passed in)
         4. RAISE ERROR — never hardcode NAV
         """
-        # Try Alpaca live NAV
+        if hasattr(self.broker, 'sync_account'):
+            try:
+                acct = self.broker.sync_account()
+                nav = acct.get("nav", 0)
+                if nav and nav > 0:
+                    logger.info("NAV resolved from broker: $%.2f", nav)
+                    return nav
+            except Exception as e:
+                logger.debug("NAV resolution from broker.sync_account failed: %s", e)
+
         if hasattr(self.broker, 'get_nav'):
             try:
                 nav = self.broker.get_nav()
                 if nav and nav > 0:
-                    logger.info("NAV resolved from Alpaca: $%.2f", nav)
+                    logger.info("NAV resolved from broker.get_nav: $%.2f", nav)
                     return nav
-            except Exception:
-                pass
-        
+            except Exception as e:
+                logger.debug("NAV resolution from broker.get_nav failed: %s", e)
+
         # Try broker state
         if hasattr(self.broker, 'state') and hasattr(self.broker.state, 'nav'):
             nav = self.broker.state.nav
@@ -1267,12 +1275,11 @@ class ExecutionEngine:
         if self._requested_nav and self._requested_nav > 0:
             return self._requested_nav
 
-        # No hardcoded fallback — flag error
-        logger.error("🚨 NAV RESOLUTION FAILED: No Alpaca connection, no broker state, no requested NAV.")
-        logger.error("🚨 Check ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables.")
+        logger.error("NAV RESOLUTION FAILED: no broker connection, no state, no requested NAV.")
+        logger.error("Check Schwab authentication or pass initial_nav explicitly.")
         raise RuntimeError(
-            "NAV resolution failed. Alpaca credentials missing or broker unavailable. "
-            "Set ALPACA_API_KEY and ALPACA_SECRET_KEY in .env or environment."
+            "NAV resolution failed. Broker unavailable and no initial_nav provided. "
+            "Configure Schwab authentication or pass initial_nav to ExecutionEngine."
         )
 
     def get_nav(self) -> float:
@@ -1283,15 +1290,15 @@ class ExecutionEngine:
     def get_broker_status(self) -> dict:
         """Get current broker status and any routing alerts."""
         broker_type = type(self.broker).__name__
-        is_alpaca = broker_type == "AlpacaBroker"
+        is_live = broker_type == "SchwabBroker"
         return {
             "broker": broker_type,
-            "is_alpaca": is_alpaca,
-            "is_paper_sim": broker_type == "PaperBroker",
+            "is_live": is_live,
+            "is_trade_log_only": broker_type == "PaperBroker",
             "alert": self._broker_alert,
             "trades_today": len(self._trade_log),
-            "trades_to_alpaca": sum(1 for t in self._trade_log if t.get("broker") == "AlpacaBroker"),
-            "trades_to_paper": sum(1 for t in self._trade_log if t.get("broker") == "PaperBroker"),
+            "trades_to_broker": sum(1 for t in self._trade_log if t.get("broker") == "SchwabBroker"),
+            "trades_to_log": sum(1 for t in self._trade_log if t.get("broker") == "PaperBroker"),
         }
 
     def _log_trade_broker(self, ticker: str, side: str, quantity: int, broker_name: str):
@@ -1304,16 +1311,15 @@ class ExecutionEngine:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         if broker_name == "PaperBroker":
-            logger.warning("🚨 TRADE TO PAPER BROKER: %s %s %d — NOT reaching Alpaca dashboard",
+            logger.warning("TRADE LOG ONLY: %s %s %d — not executed on live broker",
                            side, ticker, quantity)
 
     def reconcile_positions(self) -> dict:
-        """
-        Square check: ensure engine state matches Alpaca ground truth.
-        
+        """Square check: ensure engine state matches broker ground truth.
+
         Called every heartbeat to prevent portfolio drift.
-        If engine has positions Alpaca doesn't → alert + remove from engine.
-        If Alpaca has positions engine doesn't → sync them in.
+        If engine has positions broker doesn't → alert + remove from engine.
+        If broker has positions engine doesn't → sync them in.
         """
         result = {
             "synced": [],
@@ -1321,69 +1327,63 @@ class ExecutionEngine:
             "alerts": [],
             "match": True,
         }
-        
-        # Get Alpaca ground truth
+
         if not hasattr(self.broker, 'get_positions'):
-            return result  # PaperBroker — no external sync needed
-        
-        try:
-            alpaca_positions = self.broker.get_positions()
-        except Exception as e:
-            result["alerts"].append(f"Failed to fetch Alpaca positions: {e}")
             return result
-        
-        alpaca_tickers = set(alpaca_positions.keys())
-        
-        # Get engine state positions
+
+        try:
+            broker_positions = self.broker.get_positions()
+        except Exception as e:
+            result["alerts"].append(f"Failed to fetch broker positions: {e}")
+            return result
+
+        broker_tickers = set(broker_positions.keys())
+
         if hasattr(self.broker, 'state'):
             engine_tickers = set(self.broker.state.positions.keys())
         else:
             return result
-        
-        # Engine has positions Alpaca doesn't — DRIFT
-        phantom = engine_tickers - alpaca_tickers
+
+        phantom = engine_tickers - broker_tickers
         for ticker in phantom:
             pos = self.broker.state.positions[ticker]
             logger.error(
-                "🚨 POSITION DRIFT: Engine has %s (%d shares) but Alpaca doesn't — removing from engine state",
+                "POSITION DRIFT: Engine has %s (%d shares) but broker doesn't — removing",
                 ticker, pos.quantity
             )
             result["removed"].append(ticker)
-            result["alerts"].append(f"DRIFT: {ticker} in engine but not Alpaca")
+            result["alerts"].append(f"DRIFT: {ticker} in engine but not broker")
             result["match"] = False
-            # Remove phantom position
             del self.broker.state.positions[ticker]
         
-        # Alpaca has positions engine doesn't — sync them in
-        missing = alpaca_tickers - engine_tickers
+        missing = broker_tickers - engine_tickers
         for ticker in missing:
-            ap = alpaca_positions[ticker]
-            logger.info("Syncing Alpaca position %s (%d shares) into engine state", 
-                        ticker, ap.get("quantity", 0))
+            bp = broker_positions[ticker]
+            qty = bp.get("quantity", 0) if isinstance(bp, dict) else getattr(bp, "quantity", 0)
+            logger.info("Syncing broker position %s (%d shares) into engine state", ticker, qty)
             result["synced"].append(ticker)
             result["match"] = False
-        
-        # Cross-check quantities for shared positions
-        shared = engine_tickers & alpaca_tickers
+
+        shared = engine_tickers & broker_tickers
         for ticker in shared:
             engine_qty = self.broker.state.positions[ticker].quantity
-            alpaca_qty = alpaca_positions[ticker].get("quantity", 0)
-            if engine_qty != alpaca_qty:
+            bp = broker_positions[ticker]
+            broker_qty = bp.get("quantity", 0) if isinstance(bp, dict) else getattr(bp, "quantity", 0)
+            if engine_qty != broker_qty:
                 logger.warning(
-                    "🚨 QUANTITY MISMATCH: %s engine=%d alpaca=%d — syncing to Alpaca",
-                    ticker, engine_qty, alpaca_qty
+                    "QUANTITY MISMATCH: %s engine=%d broker=%d — syncing to broker",
+                    ticker, engine_qty, broker_qty
                 )
-                result["alerts"].append(f"QTY MISMATCH: {ticker} engine={engine_qty} alpaca={alpaca_qty}")
+                result["alerts"].append(f"QTY MISMATCH: {ticker} engine={engine_qty} broker={broker_qty}")
                 result["match"] = False
-                # Update engine to match Alpaca (Alpaca is ground truth)
-                self.broker.state.positions[ticker].quantity = alpaca_qty
-        
+                self.broker.state.positions[ticker].quantity = broker_qty
+
         if result["match"]:
-            logger.debug("Position reconcile: all positions match Alpaca")
+            logger.debug("Position reconcile: all positions match broker")
         else:
             logger.warning("Position reconcile: %d drifts, %d synced, %d alerts",
                           len(result["removed"]), len(result["synced"]), len(result["alerts"]))
-        
+
         return result
 
     # --- Asset class gate ---------------------------------------------------
@@ -1507,7 +1507,8 @@ class ExecutionEngine:
                         stats = get_market_stats(ticker)
                         if stats:
                             security_data[ticker] = stats
-                    except Exception:
+                    except Exception as e:
+                        logger.warning("SecurityAnalysis: get_market_stats failed for ticker=%s: %s", ticker, e)
                         continue
 
                 if security_data:
@@ -1571,7 +1572,8 @@ class ExecutionEngine:
                         ).strftime("%Y-%m-%d"))
                         if isinstance(adj, pd.DataFrame) and not adj.empty and "Close" in adj.columns:
                             price_dict[ticker] = adj["Close"]
-                    except Exception:
+                    except Exception as e:
+                        logger.warning("PatternDiscovery: get_adj_close failed for ticker=%s: %s", ticker, e)
                         continue
 
                 if price_dict:
@@ -1788,8 +1790,8 @@ class ExecutionEngine:
                 for ds in self.distress.get_critical():
                     if ds.ticker and ds.ticker not in selected_tickers:
                         selected_tickers.append(ds.ticker)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Distressed/fallen angel ticker retrieval failed: %s", e)
 
         if not selected_tickers:
             selected_tickers = ["SPY", "QQQ", "IWM", "XLK", "XLF"]
@@ -1832,69 +1834,21 @@ class ExecutionEngine:
         t0 = datetime.now()
         options_data = {"status": "not_scanned"}
         try:
-            from .options_engine import BlackScholesModel
-            bs = BlackScholesModel()
-            from alpaca.trading.requests import GetOptionContractsRequest
-            from alpaca.trading.enums import AssetStatus, ContractType
-            
-            # Use top 10 alpha signals only (faster than 30)
             options_candidates = []
+            options_engine = getattr(self.l7, "_options_engine", None)
+            if options_engine is None:
+                raise RuntimeError("OptionsEngine is unavailable; option scan fails closed")
             for sig in alpha_out.signals[:10]:
-                ticker = sig.ticker
-                spot = 0.0
-                try:
-                    from ..data.yahoo_data import get_adj_close
-                    p = get_adj_close([ticker], start=datetime.now().strftime("%Y-%m-%d"))
-                    if not p.empty:
-                        spot = float(p[ticker].iloc[-1])
-                except Exception:
-                    continue
-                if spot <= 0:
-                    continue
-                
-                # Get options chain from Alpaca
-                try:
-                    req = GetOptionContractsRequest(
-                        underlying_symbols=[ticker],
-                        status=AssetStatus.ACTIVE,
-                        expiration_date_gte=(datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"),
-                        expiration_date_lte=(datetime.now() + timedelta(days=45)).strftime("%Y-%m-%d"),
-                        limit=20,
-                    )
-                    chain = self.broker.trading_client.get_option_contracts(req)
-                    contracts = chain.option_contracts if hasattr(chain, 'option_contracts') else []
-                    
-                    for c in contracts:
-                        if not getattr(c, 'tradable', False):
-                            continue
-                        strike = float(c.strike_price)
-                        opt_type = 'call' if c.type == ContractType.CALL else 'put'
-                        iv = float(c.implied_volatility) if hasattr(c, 'implied_volatility') and c.implied_volatility else 0.30
-                        T = max((datetime.strptime(c.expiration_date, "%Y-%m-%d") - datetime.now()).days / 365.0, 0.001)
-                        if opt_type == 'call':
-                            theo = bs.call_price(spot, strike, T, 0.05, iv)
-                        else:
-                            theo = bs.put_price(spot, strike, T, 0.05, iv)
-                        delta = bs.delta(spot, strike, T, 0.05, iv, opt_type == 'call')
-                        
-                        options_candidates.append({
-                            "ticker": ticker,
-                            "symbol": c.symbol,
-                            "type": opt_type,
-                            "strike": strike,
-                            "expiry": c.expiration_date,
-                            "theo_price": round(theo, 2),
-                            "delta": round(delta, 3),
-                            "iv": round(iv, 4),
-                            "alpha": sig.alpha_pred,
-                            "momentum": sig.momentum_1m,
-                        })
-                except Exception:
-                    pass
-            
+                options_candidates.extend(options_engine.scan_opportunities(
+                    sig.ticker, allocation={
+                        "options_budget": self._dynamic_nav * .01,
+                        "current_beta": self.beta.current_beta,
+                        "target_beta": cube_out.target_beta,
+                    },
+                    regime=cube_out.regime.value, max_results=3,
+                ))
+
             if options_candidates:
-                for o in options_candidates:
-                    o["score"] = abs(o["alpha"]) * abs(o["delta"]) * (1 + abs(o["momentum"]))
                 options_candidates.sort(key=lambda x: x["score"], reverse=True)
                 options_data = {
                     "total_scanned": len(options_candidates),
@@ -2032,8 +1986,8 @@ class ExecutionEngine:
                 "sleeve_beta": sleeve_beta,
                 "hedge_requirement": abu_hedge,
             }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("AlphaBetaUnleashed beta computation failed: %s", e, exc_info=True)
         result["stages"]["beta"] = {
             "target_beta": beta_state.target_beta,
             "current_beta": beta_state.current_beta,
@@ -2072,8 +2026,8 @@ class ExecutionEngine:
                 with open(_credit_path) as _f:
                     _credit_data = _json.load(_f)
                     _credit_map = _credit_data.get("ratings", {})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Credit classification JSON load failed: %s", e)
 
         def _get_sleeve_budget(ticker: str) -> float:
             """Route ticker to its credit-appropriate sleeve budget."""
@@ -2081,8 +2035,8 @@ class ExecutionEngine:
             category = credit.get("category", "")
             egan = credit.get("egan_tier", "")
 
-            # Distressed (F tier or HY_DISTRESSED)
-            if egan in ("E", "F") or category == "HY_DISTRESSED":
+            # Distressed (F tier or DISTRESSED_EQUITY)
+            if egan in ("E", "F") or category == "DISTRESSED_EQUITY":
                 return distressed_budget
             # HY equity
             if category == "HY" or egan in ("C", "D"):
@@ -2106,7 +2060,8 @@ class ExecutionEngine:
                     ticker_rets = rets.iloc[:, 0]
                 else:
                     continue
-            except Exception:
+            except Exception as e:
+                logger.warning("ML voting: get_returns failed for ticker=%s: %s", ticker, e)
                 continue
 
             # Vote
@@ -2165,11 +2120,9 @@ class ExecutionEngine:
 
             # Execute — with stop/take_profit from quant technical consensus
             levels = hft_stop_levels.get(ticker, {})
-            order = self.broker.place_order(
-                ticker=ticker,
-                side=allocation["side"],
-                quantity=allocation["quantity"],
-                signal_type=vote.signal,
+            order = self.l7_submit(
+                ticker=ticker, side=allocation["side"].value, quantity=allocation["quantity"],
+                signal_type=vote.signal.value, regime=cube_out.regime.value,
                 reason=f"Vote={vote.score:.1f} Alpha={alpha_map.get(ticker, AlphaSignal(ticker=ticker)).alpha_pred:.4f} Conf={vote.confidence:.2f}",
                 stop_loss=levels.get("stop_loss") or None,
                 take_profit=levels.get("take_profit") or None,
@@ -2186,7 +2139,7 @@ class ExecutionEngine:
                 "vote_score": vote.score,
                 "confidence": vote.confidence,
                 "signal": vote.signal.value,
-                "order_id": order.id,
+                "order_id": (order or {}).get("order_id", ""),
                 "hft_size_mult": hft_size_adjustments.get(ticker, 1.0),
                 "stop_loss": levels.get("stop_loss", 0.0),
                 "take_profit": levels.get("take_profit", 0.0),
@@ -2198,12 +2151,10 @@ class ExecutionEngine:
         # Beta rebalance via SPY
         if beta_action.action != "HOLD":
             side = OrderSide.BUY if beta_action.action == "BUY" else OrderSide.SELL
-            self.broker.place_order(
-                ticker="SPY",
-                side=side,
-                quantity=beta_action.quantity,
-                signal_type=SignalType.MICRO_PRICE_BUY if side == OrderSide.BUY else SignalType.MICRO_PRICE_SELL,
-                reason=beta_action.reason,
+            self.l7_submit(
+                ticker="SPY", side=side.value, quantity=beta_action.quantity,
+                signal_type=(SignalType.MICRO_PRICE_BUY if side == OrderSide.BUY else SignalType.MICRO_PRICE_SELL).value,
+                regime=cube_out.regime.value, reason=beta_action.reason,
             )
 
         result["stages"]["execution"] = {
@@ -2286,8 +2237,8 @@ class ExecutionEngine:
                             self.learning.record_sector_feedback(
                                 sector, "OVERWEIGHT", recent_ret
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Learning loop: sector feedback recording failed for sector=%s: %s", sector, e)
 
             # Apply learned tier weights to ensemble (continuous adaptation)
             weight_changes = self.learning.apply_to_ensemble(self.ensemble)
@@ -2365,7 +2316,7 @@ class ExecutionEngine:
     ) -> Optional[dict]:
         """Route a trade through the L7 Unified Execution Surface.
 
-        Falls back to direct broker execution if L7 is not available.
+        L7 is mandatory for execution routing; unavailable L7 fails closed.
         """
         if self.l7 is not None:
             order = self.l7.submit_order(
@@ -2375,18 +2326,10 @@ class ExecutionEngine:
             )
             return order.to_dict()
 
-        # Fallback: direct broker
-        side_enum = OrderSide(side) if side in [s.value for s in OrderSide] else OrderSide.BUY
-        sig_enum = SignalType.HOLD
-        try:
-            sig_enum = SignalType(signal_type)
-        except (ValueError, KeyError):
-            pass
-        order = self.broker.place_order(
-            ticker=ticker, side=side_enum, quantity=quantity,
-            signal_type=sig_enum,
-        )
-        return order.to_dict()
+        return {
+            "ticker": ticker, "side": side, "quantity": quantity,
+            "status": "REJECTED", "reason": "L7 execution surface is unavailable",
+        }
 
     def l7_heartbeat(self, regime: str = "TRENDING"):
         """Forward heartbeat to L7 surface (called every minute)."""
